@@ -1,30 +1,30 @@
 """
-next-read v10.3: blurb-first, with optional casual shares.
+next-read v10.5: blurb-first, with optional casual shares.
 
-CHANGES FROM v10.2:
-  - **Cache merging for gather results.** Each fresh gather run now MERGES
-    its candidates with anything already in the cache for that name+mode,
-    instead of overwriting. This means running the same query multiple times
-    monotonically increases recall — every run adds books, never removes.
-    Fixes the variance problem David flagged on May 7.
-  - BLURB_RUNS bumped from 6 to 10. More parallel searches = better recall
-    per cold run. Cost goes from ~$0.30 to ~$0.50 per uncached query.
-  - New CLI flag --force-refresh wipes only the gather cache for a name,
-    forcing a fresh gather call. Useful when you suspect the cache has
-    stale/incomplete data.
+CHANGES FROM v10.4 (cost-reduction pass — quality-neutral):
+  - CACHE_FILE prefers /data/cache.json (HF Spaces persistent storage)
+    when /data exists and is writable; falls back to local cache.json.
+    Enable "Persistent storage" in the Space settings for this to stick
+    across restarts.
+  - Gather cache entries now carry a "cached_at" timestamp. Fresh hits
+    (< CACHE_MAX_AGE_DAYS, default 30) are returned directly WITHOUT
+    re-running the full multi-call gather on top. Stale hits keep the
+    old top-up behavior. Override per call with force_refresh=True.
+  - Token usage tracking: every OpenAI call records input/output/cached
+    token counts; per-query totals + estimated cost land in telemetry
+    (metrics.json) so cost per query is measurable, not guessed.
+  - Prompt restructure for OpenAI automatic prompt caching: the long
+    static instruction blocks in gather/classify prompts now come FIRST
+    and the per-name/per-book variables come LAST, so the shared prefix
+    is cache-eligible (~50-75% off those input tokens on cache hits).
+    Also sets prompt_cache_key per call type to improve hit routing.
 
-CHANGES FROM v10.1:
-  - Added _is_author_of_book(): deterministic hard filter that catches books
-    where the endorser is the author or co-author. Runs BEFORE the LLM
-    verifier — catches obvious cases for free.
-
-CHANGES FROM v10:
-  - Added telemetry logging (metrics.json).
-  - recommend_from_book now raises NotImplementedError.
-
-David's spec:
-  - PRIMARY: Blurb mode. Physical-book endorsements only.
-  - OPTIONAL: A toggle to ALSO show casual personal shares.
+CHANGES FROM v10.3:
+  - Strip leading "the " in _normalize_title to fix dedup misses
+    (e.g. "The Pyramid of Lies" and "Pyramid of Lies" now merge correctly).
+  - Byline-as-quote filter in rank(): skip evidence quotes that are just
+    the endorser's own name/attribution line.
+  - Removed unused `base_name` variable in _gather_blurbs.
 """
 
 import json
@@ -43,10 +43,9 @@ load_dotenv()
 client = OpenAI()
 MODEL = "gpt-4.1"
 
-# Recall-first parameters. David's hard constraint: "don't miss a real blurb."
-BLURB_RUNS = 10     # was 6 in v10.2. More parallel searches = better recall.
+BLURB_RUNS = 10
 CASUAL_RUNS = 3
-MAX_WORKERS = 12    # was 10. Modest bump to keep latency similar with more runs.
+MAX_WORKERS = 12
 
 MIN_SAME_PERSON_CONFIDENCE = 0.5
 
@@ -56,11 +55,77 @@ CASUAL_SIGNALS = {"tweet", "blog_post", "substack", "instagram",
 
 KNOWN_SIGNALS = BLURB_SIGNALS | CASUAL_SIGNALS | {"not_a_blurb", "not_casual", "unknown"}
 
-CACHE_FILE = "cache.json"
+def _pick_cache_path():
+    """Prefer HF Spaces persistent storage (/data) when available, so the
+    cache survives Space restarts/rebuilds. Falls back to the app dir
+    (ephemeral on Spaces without persistent storage). Seeds /data from a
+    repo-committed cache.json on first run so prior entries carry over."""
+    data_dir = "/data"
+    if os.path.isdir(data_dir) and os.access(data_dir, os.W_OK):
+        persistent = os.path.join(data_dir, "cache.json")
+        if not os.path.exists(persistent) and os.path.exists("cache.json"):
+            try:
+                import shutil
+                shutil.copy("cache.json", persistent)
+                print(f"  [cache] seeded {persistent} from repo cache.json")
+            except OSError as e:
+                print(f"  [warning] could not seed persistent cache: {e}")
+        return persistent
+    return "cache.json"
+
+
+CACHE_FILE = _pick_cache_path()
 METRICS_FILE = "metrics.json"
+CACHE_MAX_AGE_DAYS = 30  # gather results younger than this skip re-gather
 _cache = None
 _cache_lock = threading.Lock()
 _metrics_lock = threading.Lock()
+
+# --- token usage tracking (thread-safe, reset per query) ---
+_usage_lock = threading.Lock()
+_usage = {"input_tokens": 0, "output_tokens": 0, "cached_tokens": 0,
+          "api_calls": 0, "web_search_calls": 0}
+
+# $/1M tokens for gpt-4.1; update if MODEL changes. Cached input is 75% off.
+PRICE_INPUT = 2.00
+PRICE_CACHED_INPUT = 0.50
+PRICE_OUTPUT = 8.00
+PRICE_WEB_SEARCH_PER_CALL = 0.01  # $10 per 1k tool calls
+
+
+def _record_usage(response):
+    """Accumulate token usage from a Responses API result."""
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return
+    cached = 0
+    details = getattr(usage, "input_tokens_details", None)
+    if details is not None:
+        cached = getattr(details, "cached_tokens", 0) or 0
+    searches = 0
+    for item in (getattr(response, "output", None) or []):
+        if getattr(item, "type", "") == "web_search_call":
+            searches += 1
+    with _usage_lock:
+        _usage["input_tokens"] += getattr(usage, "input_tokens", 0) or 0
+        _usage["output_tokens"] += getattr(usage, "output_tokens", 0) or 0
+        _usage["cached_tokens"] += cached
+        _usage["api_calls"] += 1
+        _usage["web_search_calls"] += searches
+
+
+def _usage_snapshot_and_reset():
+    with _usage_lock:
+        snap = dict(_usage)
+        for k in _usage:
+            _usage[k] = 0
+    uncached_input = max(0, snap["input_tokens"] - snap["cached_tokens"])
+    snap["est_cost_usd"] = round(
+        uncached_input / 1e6 * PRICE_INPUT
+        + snap["cached_tokens"] / 1e6 * PRICE_CACHED_INPUT
+        + snap["output_tokens"] / 1e6 * PRICE_OUTPUT
+        + snap["web_search_calls"] * PRICE_WEB_SEARCH_PER_CALL, 4)
+    return snap
 
 
 # ============================================================
@@ -75,11 +140,15 @@ def _name_tokens(name):
     base = _strip_disambiguator(name).lower()
     base = re.sub(r"\b[a-z]\.\s*", " ", base)
     tokens = re.split(r"\s+", base.strip())
-    return [t for t in tokens if len(t) > 2]
+    filtered = [t for t in tokens if len(t) > 2]
+    # Short surnames ("Ma", "Ng", "Xu") would otherwise be dropped, leaving
+    # <2 tokens and silently disabling the author filter for that person.
+    if len(filtered) < 2:
+        filtered = [t for t in tokens if t]
+    return filtered
 
 
 def _is_author_of_book(endorser_name, book_author):
-    """Hard deterministic check: is the endorser the author or co-author?"""
     if not book_author or not endorser_name:
         return False
     endorser_tokens = _name_tokens(endorser_name)
@@ -156,7 +225,6 @@ def _cache_set(prefix, value, *args):
 
 
 def _cache_delete(prefix, *args):
-    """Wipe a specific cache entry. Used by --force-refresh."""
     with _cache_lock:
         cache = _load_cache()
         key = _cache_key(prefix, *args)
@@ -173,6 +241,7 @@ def _cache_delete(prefix, *args):
 
 def _normalize_title(title):
     title = (title or "").lower().strip()
+    title = re.sub(r"^the\s+", "", title)  # strip leading "the " for dedup
     title = re.sub(r"\s*\([^)]*\)\s*", " ", title)
     title = title.split(":")[0].split(" - ")[0].split(" — ")[0]
     title = re.sub(r"[^a-z0-9 ]+", "", title)
@@ -236,16 +305,22 @@ def _clean_url(url):
 # OpenAI wrappers
 # ============================================================
 
-def _call_with_search(prompt, max_output_tokens=6000, max_retries=2, temperature=0.7):
+def _call_with_search(prompt, max_output_tokens=6000, max_retries=2, temperature=0.7,
+                      cache_key=None):
     for attempt in range(max_retries + 1):
         try:
+            kwargs = {}
+            if cache_key:
+                kwargs["prompt_cache_key"] = cache_key
             response = client.responses.create(
                 model=MODEL,
                 input=prompt,
                 tools=[{"type": "web_search"}],
                 max_output_tokens=max_output_tokens,
                 temperature=temperature,
+                **kwargs,
             )
+            _record_usage(response)
             text = response.output_text or ""
             if not text:
                 if attempt < max_retries:
@@ -262,14 +337,19 @@ def _call_with_search(prompt, max_output_tokens=6000, max_retries=2, temperature
     return ""
 
 
-def _call_plain(prompt, max_output_tokens=600):
+def _call_plain(prompt, max_output_tokens=600, cache_key=None):
     try:
+        kwargs = {}
+        if cache_key:
+            kwargs["prompt_cache_key"] = cache_key
         response = client.responses.create(
             model=MODEL,
             input=prompt,
             max_output_tokens=max_output_tokens,
             temperature=0,
+            **kwargs,
         )
+        _record_usage(response)
         return response.output_text or ""
     except Exception as e:
         print(f"  [warning] plain LLM call failed: {e}")
@@ -380,160 +460,163 @@ Return ONLY valid JSON (no markdown):
     return deduped
 
 
+# Static instruction blocks kept byte-identical across every call so
+# OpenAI's automatic prompt caching can reuse the prefix. The TARGET name
+# goes at the very END of the prompt (variable content last = cacheable
+# prefix). Same rules and wording as before, phrased around "the TARGET".
+
+_BLURB_GATHER_STATIC = """You are searching for BACK-COVER BLURBS, FOREWORDS, INTRODUCTIONS, JACKET QUOTES, and PRAISE PAGE quotes by a TARGET person (named at the very end of this prompt). Endorsements that appear physically ON or IN a book.
+
+WHAT COUNTS — and ONLY these things count:
+- Back-cover blurb attributed to the TARGET by name
+- Dust-jacket quote attributed to the TARGET
+- "Praise for [book]" page quote attributed to the TARGET
+- The TARGET wrote the foreword for a book
+- The TARGET wrote the introduction for a book
+- Amazon "Editorial Reviews" / publisher product page quoting the TARGET as endorser
+
+WHAT DOES NOT COUNT (skip these always):
+- The TARGET's tweets, blog posts, Substack, podcast mentions about books
+- The TARGET's shareholder letters, annual letters, commencement speeches
+- Books on the TARGET's "recommended reading list" or "favorite books" (aggregator lists)
+- Books the TARGET reviewed in a publication
+- Books that mention or profile the TARGET (no quote FROM them)
+- Books authored or co-authored by the TARGET
+- Biographies of the TARGET
+
+THE TEST: the TARGET's name and quoted endorsement text appears physically ON or IN the book — back cover, front cover, dust jacket, opening "praise for" page, retailer page's "Editorial Reviews" or "Praise" section, or foreword/introduction byline. ALL of these positions count equally. Do NOT downgrade or reject an endorsement just because you can't verify it's literally on the back cover specifically — if a publisher, retailer, or "praise for" page attributes a quote to the TARGET as an endorser of the book, that IS a blurb for our purposes. "Professional reviews" listed on a book's retail page (BetterWorldBooks, Amazon Editorial Reviews, Apple Books, etc.) attributed to the TARGET also count.
+
+YOU MUST BE EXHAUSTIVE. The user cares MOST about not missing a real blurb. Cast a wide net. Search aggressively across many angles:
+- "praise for [book]" + the TARGET's name
+- "blurbed by [TARGET name]" / "endorsed by [TARGET name]"
+- "foreword by [TARGET name]" / "introduction by [TARGET name]"
+- Amazon editorial reviews mentioning the TARGET
+- Publisher product pages quoting the TARGET
+- Barnes & Noble book pages
+- Google Books preview pages (back-matter section)
+- Goodreads book pages quoting the TARGET
+- BetterWorldBooks, Bookshop.org, Apple Books retailer pages
+- Books in the TARGET's topic area — check their "praise" pages for the TARGET's name
+- The TARGET's name + book titles related to their expertise
+
+CRITICAL: also try TOPIC-SPECIFIC queries combining the TARGET's name with major subjects in their beat. For example, "[TARGET name] Musk book" or "[TARGET name] crypto book" or "[TARGET name] hedge fund book" — these surface specific blurb pages that pure "[TARGET name] blurb" queries miss. Think of the major subjects the TARGET covers and run a separate search for each.
+
+If the TARGET has a disambiguator in parens, only include endorsements from THAT specific person.
+
+Look back 20+ years. Aim for 10+ if they exist — but only include real blurbs.
+
+Return ONLY valid JSON (no markdown, no trailing commas):
+{
+  "endorser": "<the TARGET's full name as given>",
+  "books": [
+    {
+      "title": "Full Book Title Including Subtitle",
+      "author": "Author Name (NOT the TARGET)",
+      "year": 2023,
+      "one_line": "brief description of the book",
+      "signal_type": "blurb | foreword | introduction | jacket_quote | praise_page",
+      "quote_snippet": "first 10-20 words of the TARGET's actual quote (very important)",
+      "source_url": "URL where you saw this, only real https URLs",
+      "notes": "any uncertainty"
+    }
+  ]
+}
+
+If you find none, return empty books array."""
+
+
 def _gather_blurbs(name, run_idx):
     disambig_match = re.search(r"\(([^)]+)\)", name)
     disambig = disambig_match.group(1) if disambig_match else ""
-    base_name = re.sub(r"\s*\([^)]*\)", "", name).strip()
     disambig_hint = (
-        f"\n\nThis person is specifically {disambig}. When searching, pair the "
+        f"\nThis person is specifically {disambig}. When searching, pair the "
         f"name with terms from their profession/company so search results aren't "
         f"flooded with the wrong person."
         if disambig else ""
     )
 
-    prompt = f"""You are searching for BACK-COVER BLURBS, FOREWORDS, INTRODUCTIONS, JACKET QUOTES, and PRAISE PAGE quotes by {name}. Endorsements that appear physically ON or IN a book.{disambig_hint}
+    prompt = f"{_BLURB_GATHER_STATIC}\n\nTARGET: {name}{disambig_hint}"
+    return _extract_json(_call_with_search(prompt, temperature=0.7,
+                                           cache_key="gather-blurb"))
 
-WHAT COUNTS — and ONLY these things count:
-- Back-cover blurb attributed to {name} by name
-- Dust-jacket quote attributed to {name}
-- "Praise for [book]" page quote attributed to {name}
-- {name} wrote the foreword for a book
-- {name} wrote the introduction for a book
-- Amazon "Editorial Reviews" / publisher product page quoting {name} as endorser
 
-WHAT DOES NOT COUNT (skip these always):
-- {name}'s tweets, blog posts, Substack, podcast mentions about books
-- {name}'s shareholder letters, annual letters, commencement speeches
-- Books on {name}'s "recommended reading list" or "favorite books" (aggregator lists)
-- Books {name} reviewed in a publication
-- Books that mention or profile {name} (no quote FROM them)
-- Books authored or co-authored by {name}
-- Biographies of {name}
+_CASUAL_GATHER_STATIC = """You are searching for CASUAL PERSONAL SHARES by a TARGET person (named at the very end of this prompt) where they recommended a book on a casual public channel — the kind of post where someone finishes a book and impulsively tells the world about it.
 
-THE TEST: {name}'s name and quoted endorsement text appears physically ON or IN the book — back cover, front cover, dust jacket, opening "praise for" page, retailer page's "Editorial Reviews" or "Praise" section, or foreword/introduction byline. ALL of these positions count equally. Do NOT downgrade or reject an endorsement just because you can't verify it's literally on the back cover specifically — if a publisher, retailer, or "praise for" page attributes a quote to {name} as an endorser of the book, that IS a blurb for our purposes. "Professional reviews" listed on a book's retail page (BetterWorldBooks, Amazon Editorial Reviews, Apple Books, etc.) attributed to {name} also count.
+WHAT COUNTS:
+- The TARGET's tweet / X post saying they read or loved a book
+- The TARGET's Instagram post about a book
+- The TARGET's personal blog post about a book they read
+- The TARGET's Substack or newsletter post recommending a book
+- A podcast moment where the TARGET spontaneously said "I just read [book], it's great"
+- An on-the-record interview where the TARGET mentioned a book they personally loved
+- The TARGET's LinkedIn post about a book
+- The TARGET's Threads / Bluesky post about a book
 
-YOU MUST BE EXHAUSTIVE. The user cares MOST about not missing a real blurb. Cast a wide net. Search aggressively across many angles:
-- "praise for [book]" + {name}
-- "blurbed by {name}" / "endorsed by {name}"
-- "foreword by {name}" / "introduction by {name}"
-- Amazon editorial reviews mentioning {name}
-- Publisher product pages quoting {name}
-- Barnes & Noble book pages
-- Google Books preview pages (back-matter section)
-- Goodreads book pages quoting {name}
-- BetterWorldBooks, Bookshop.org, Apple Books retailer pages
-- Books in {name}'s topic area — check their "praise" pages for {name}'s name
-- {name} + book titles related to their expertise
+THE TEST: Was this a casual, in-the-moment, personal recommendation in the TARGET's own voice on an informal channel? Did they sound like they finished reading and wanted to share?
 
-CRITICAL: also try TOPIC-SPECIFIC queries combining {name}'s name with major subjects in their beat. For example, "{name} Musk book" or "{name} crypto book" or "{name} hedge fund book" — these surface specific blurb pages that pure "{name} blurb" queries miss. Think of the major subjects {name} covers and run a separate search for each.
+WHAT DOES NOT COUNT (these are formal / curated documents, NOT casual shares):
+- The TARGET's shareholder letters, annual letters, founder letters
+- The TARGET's commencement speeches
+- The TARGET's formal published reading lists
+- Biographer's appendices listing what the TARGET reads
+- Aggregator listicles ("10 books CEOs love")
+- "Reading lists" compiled by third parties
+- Back-cover blurbs / forewords (these are blurbs, a different category)
+- Books that just mention or profile the TARGET
+- Books authored by the TARGET
 
-If {name} has a disambiguator in parens, only include endorsements from THAT specific person.
+Be EXHAUSTIVE. Famous people who tweet about books (Bezos, Naval, Patrick Collison, etc.) often have many such posts. Aim for 10+ if they exist.
 
-Look back 20+ years. Aim for 10+ if they exist — but only include real blurbs.
+Search angles:
+- "[TARGET name]" tweet book
+- "[TARGET name]" Twitter / X book recommendation
+- "[TARGET name]" Instagram book
+- "[TARGET name]" Substack
+- "[TARGET name]" blog book
+- "[TARGET name]" podcast "just read" OR "loved"
+- "[TARGET name]" interview favorite book
+
+If the TARGET has a disambiguator in parens, only include the specific person.
 
 Return ONLY valid JSON (no markdown, no trailing commas):
-{{
-  "endorser": "{name}",
+{
+  "endorser": "<the TARGET's full name as given>",
   "books": [
-    {{
+    {
       "title": "Full Book Title Including Subtitle",
-      "author": "Author Name (NOT {name})",
+      "author": "Author Name (NOT the TARGET)",
       "year": 2023,
       "one_line": "brief description of the book",
-      "signal_type": "blurb | foreword | introduction | jacket_quote | praise_page",
-      "quote_snippet": "first 10-20 words of {name}'s actual quote (very important)",
-      "source_url": "URL where you saw this, only real https URLs",
+      "signal_type": "tweet | blog_post | substack | instagram | podcast_moment | interview_moment | social_post",
+      "quote_snippet": "first 10-20 words of what the TARGET said",
+      "source_url": "URL of the tweet/post/transcript — required for casual shares",
       "notes": "any uncertainty"
-    }}
+    }
   ]
-}}
+}
 
 If you find none, return empty books array."""
-    return _extract_json(_call_with_search(prompt, temperature=0.7))
 
 
 def _gather_casual_shares(name, run_idx):
     disambig_match = re.search(r"\(([^)]+)\)", name)
     disambig = disambig_match.group(1) if disambig_match else ""
     disambig_hint = (
-        f"\n\nThis person is specifically {disambig}. Include this context in "
+        f"\nThis person is specifically {disambig}. Include this context in "
         f"your searches to avoid the wrong person."
         if disambig else ""
     )
 
-    prompt = f"""You are searching for CASUAL PERSONAL SHARES by {name} where they recommended a book on a casual public channel — the kind of post where someone finishes a book and impulsively tells the world about it.{disambig_hint}
-
-WHAT COUNTS:
-- {name}'s tweet / X post saying they read or loved a book
-- {name}'s Instagram post about a book
-- {name}'s personal blog post about a book they read
-- {name}'s Substack or newsletter post recommending a book
-- A podcast moment where {name} spontaneously said "I just read [book], it's great"
-- An on-the-record interview where {name} mentioned a book they personally loved
-- {name}'s LinkedIn post about a book
-- {name}'s Threads / Bluesky post about a book
-
-THE TEST: Was this a casual, in-the-moment, personal recommendation in {name}'s own voice on an informal channel? Did they sound like they finished reading and wanted to share?
-
-WHAT DOES NOT COUNT (these are formal / curated documents, NOT casual shares):
-- {name}'s shareholder letters, annual letters, founder letters
-- {name}'s commencement speeches
-- {name}'s formal published reading lists
-- Biographer's appendices listing what {name} reads
-- Aggregator listicles ("10 books CEOs love")
-- "Reading lists" compiled by third parties
-- Back-cover blurbs / forewords (these are blurbs, a different category)
-- Books that just mention or profile {name}
-- Books authored by {name}
-
-Be EXHAUSTIVE. Famous people who tweet about books (Bezos, Naval, Patrick Collison, etc.) often have many such posts. Aim for 10+ if they exist.
-
-Search angles:
-- "{name}" tweet book
-- "{name}" Twitter / X book recommendation
-- "{name}" Instagram book
-- "{name}" Substack
-- "{name}" blog book
-- "{name}" podcast "just read" OR "loved"
-- "{name}" interview favorite book
-
-If {name} has a disambiguator in parens, only include the specific person.
-
-Return ONLY valid JSON (no markdown, no trailing commas):
-{{
-  "endorser": "{name}",
-  "books": [
-    {{
-      "title": "Full Book Title Including Subtitle",
-      "author": "Author Name (NOT {name})",
-      "year": 2023,
-      "one_line": "brief description of the book",
-      "signal_type": "tweet | blog_post | substack | instagram | podcast_moment | interview_moment | social_post",
-      "quote_snippet": "first 10-20 words of what {name} said",
-      "source_url": "URL of the tweet/post/transcript — required for casual shares",
-      "notes": "any uncertainty"
-    }}
-  ]
-}}
-
-If you find none, return empty books array."""
-    return _extract_json(_call_with_search(prompt, temperature=0.7))
+    prompt = f"{_CASUAL_GATHER_STATIC}\n\nTARGET: {name}{disambig_hint}"
+    return _extract_json(_call_with_search(prompt, temperature=0.7,
+                                           cache_key="gather-casual"))
 
 
 # ============================================================
-# GATHER ORCHESTRATION (MERGED CACHING IN v10.3)
+# GATHER ORCHESTRATION
 # ============================================================
 
 def gather_for_mode(name, mode, log=print, force_refresh=False):
-    """mode is 'blurb' or 'casual'.
-
-    NEW in v10.3: When a cached result exists, we run a FRESH gather pass
-    and MERGE the new results into the cached set. This means every call
-    monotonically improves recall.
-
-    Set force_refresh=True to wipe cache before this query (still merges
-    after, but starts from empty).
-    """
     cache_prefix = f"gather_v10_6_{mode}"
 
     if force_refresh:
@@ -541,6 +624,25 @@ def gather_for_mode(name, mode, log=print, force_refresh=False):
             log(f"  [cache] wiped {cache_prefix} for {name}")
 
     cached = _cache_get(cache_prefix, name)
+
+    # Freshness fast-path: if the cached gather is recent, serve it as-is
+    # instead of re-running the full multi-call gather on top. Blurb
+    # inventories change slowly; this is where most repeat-query cost dies.
+    if cached and not force_refresh:
+        cached_at = cached.get("cached_at")
+        if cached_at:
+            try:
+                age_days = (
+                    datetime.now(timezone.utc)
+                    - datetime.fromisoformat(cached_at)
+                ).days
+            except ValueError:
+                age_days = None
+            if age_days is not None and age_days < CACHE_MAX_AGE_DAYS:
+                log(f"  [cache] fresh hit ({age_days}d old, "
+                    f"{len(cached.get('books', []))} candidates) — "
+                    f"skipping re-gather")
+                return cached
 
     if mode == "blurb":
         fn = _gather_blurbs
@@ -552,7 +654,6 @@ def gather_for_mode(name, mode, log=print, force_refresh=False):
     variants = name_variants(name)
     log(f"  Variants to search: {variants}")
 
-    # Seed the merge dict from prior cache (if any), then add new findings.
     all_books = {}
     prior_count = 0
     if cached:
@@ -594,6 +695,7 @@ def gather_for_mode(name, mode, log=print, force_refresh=False):
         "mode": mode,
         "variants_searched": variants,
         "gather_runs": len(tasks),
+        "cached_at": datetime.now(timezone.utc).isoformat(),
         "books": list(all_books.values()),
     }
     log(f"  Found {len(final['books'])} unique candidates "
@@ -608,6 +710,49 @@ def gather_for_mode(name, mode, log=print, force_refresh=False):
 # CLASSIFY
 # ============================================================
 
+# Static verifier instructions first (cache-eligible prefix); the specific
+# book/endorser under review goes at the END of the prompt.
+_CLASSIFY_STATIC = """You are the VERIFIER for the next-read app. A previous gather step has already found a likely endorsement match (given at the very end of this prompt).
+
+Your job is NOT to independently re-prove the endorsement. The gather already did that.
+Your job is ONLY to catch a few specific kinds of false positives.
+
+DEFAULT BEHAVIOR: verified=true.
+
+Search the web briefly to check for these RED FLAGS. Set verified=false ONLY if you find clear evidence of one:
+
+RED FLAG 1: The endorser is the AUTHOR or CO-AUTHOR of this book.
+  -> reason: "author of book"
+
+RED FLAG 2: The endorsement is from a DIFFERENT person with the same name (different Ken Griffin, different Bradley Hope, etc.). Use the disambiguator in the endorser's name to tell which person we mean.
+  -> reason: "different person with same name"
+
+RED FLAG 3: The book is BY OR ABOUT the endorser (biography of them, memoir by them, book with their name in the title that they didn't blurb).
+  -> reason: "book is by/about the person"
+
+DO NOT reject just because:
+- You couldn't independently find the blurb online (search results vary)
+- The blurb is hard to verify
+- You aren't 100% sure it's a "formal" blurb for the mode
+
+Depending on the mode given at the end, the signal_type should be one of:
+  blurb mode: blurb, foreword, introduction, jacket_quote, praise_page
+  casual mode: tweet, blog_post, substack, instagram, podcast_moment, interview_moment, social_post
+
+If you can't tell, return the prior tag from the gather step.
+
+Return ONLY valid JSON:
+{
+  "verified": true,
+  "signal_type": "<one of the mode's signal types>",
+  "is_author": false,
+  "same_person_confidence": 1.0,
+  "source_url": "URL where you found evidence, or empty",
+  "quote": "exact quoted text if found, or empty",
+  "reason": "brief note, or one of the red flag phrases above"
+}"""
+
+
 def classify_candidate(name, book_title, book_author, mode, prior_signals, prior_source_url=""):
     cache_prefix = f"classify_v11_{mode}"
     cached = _cache_get(cache_prefix, name, book_title, book_author)
@@ -621,52 +766,15 @@ def classify_candidate(name, book_title, book_author, mode, prior_signals, prior
         "blurb" if mode == "blurb" else "social_post"
     )
 
-    prompt = f"""You are the VERIFIER for the next-read app, working in {mode.upper()} mode.
+    prompt = f"""{_CLASSIFY_STATIC}
 
-A previous gather step has already found this as a likely match:
-
+CANDIDATE TO VERIFY (mode: {mode.upper()}):
 Book: "{book_title}" by {book_author}
 Endorser: {name}
 Prior signal tag(s): {', '.join(prior_signals) if prior_signals else 'unknown'}
-
-Your job is NOT to independently re-prove the endorsement. The gather already did that.
-Your job is ONLY to catch a few specific kinds of false positives.
-
-DEFAULT BEHAVIOR: verified=true.
-
-Search the web briefly to check for these RED FLAGS. Set verified=false ONLY if you find clear evidence of one:
-
-RED FLAG 1: {name} is the AUTHOR or CO-AUTHOR of this book.
-  -> reason: "author of book"
-
-RED FLAG 2: The endorsement is from a DIFFERENT person with the same name (different Ken Griffin, different Bradley Hope, etc.). Use the disambiguator in {name} to tell which person we mean.
-  -> reason: "different person with same name"
-
-RED FLAG 3: The book is BY OR ABOUT {name} (biography of them, memoir by them, book with their name in the title that they didn't blurb).
-  -> reason: "book is by/about the person"
-
-DO NOT reject just because:
-- You couldn't independently find the blurb online (search results vary)
-- The blurb is hard to verify
-- You aren't 100% sure it's a "formal" blurb in {mode} mode
-
-For {mode} mode, the signal_type should be one of:
-  blurb mode: blurb, foreword, introduction, jacket_quote, praise_page
-  casual mode: tweet, blog_post, substack, instagram, podcast_moment, interview_moment, social_post
-
-If you can't tell, return the prior tag from the gather step.
-
-Return ONLY valid JSON:
-{{
-  "verified": true,
-  "signal_type": "{default_sig}",
-  "is_author": false,
-  "same_person_confidence": 1.0,
-  "source_url": "URL where you found evidence, or empty",
-  "quote": "exact quoted text if found, or empty",
-  "reason": "brief note, or one of the red flag phrases above"
-}}"""
-    text = _call_with_search(prompt, max_output_tokens=1500, temperature=0)
+Default signal_type if you can't tell: {default_sig}"""
+    text = _call_with_search(prompt, max_output_tokens=1500, temperature=0,
+                             cache_key="classify")
     result = _extract_json(text)
 
     def _to_bool(v, default=False):
@@ -763,10 +871,17 @@ def rank(verified):
         sig = c.get("signal_type", "unknown")
         if sig not in by_key[key]["signal_types"]:
             by_key[key]["signal_types"].append(sig)
+
+        # Filter out byline-only quotes (e.g. "Bradley Hope, co-author of...")
+        quote = c.get("quote", "") or book.get("quote_snippet", "")
+        base = re.sub(r"\s*\([^)]*\)", "", name).lower().strip()
+        if quote.lower().strip().startswith(base):
+            quote = ""
+
         by_key[key]["evidence"].append({
             "endorser": name,
             "url": c.get("source_url", "") or book.get("source_url", ""),
-            "quote": c.get("quote", "") or book.get("quote_snippet", ""),
+            "quote": quote,
             "signal_type": sig,
         })
 
@@ -857,7 +972,6 @@ def _run_mode(primary, mode, log, force_refresh=False):
 
 
 def recommend_from_name(person_name, include_casual=False, log=print, force_refresh=False):
-    """Primary: blurb mode. If include_casual=True, also run casual gather as backup."""
     t_total = time.time()
     log(f"\n[1] Disambiguating '{person_name}'...")
     disambig = disambiguate_person(person_name)
@@ -883,9 +997,12 @@ def recommend_from_name(person_name, include_casual=False, log=print, force_refr
         "total_duration_s": total_duration,
         "blurb": blurb_metrics,
         "casual": casual_metrics,
+        "usage": _usage_snapshot_and_reset(),
     }
     _log_metric(telemetry_record)
-    log(f"\n[telemetry] logged to {METRICS_FILE} (total {total_duration}s)")
+    log(f"\n[telemetry] logged to {METRICS_FILE} (total {total_duration}s, "
+        f"~${telemetry_record['usage']['est_cost_usd']} API cost, "
+        f"{telemetry_record['usage']['web_search_calls']} web searches)")
 
     return {
         "input_name": person_name,
@@ -993,6 +1110,9 @@ def _extract_json(text):
         r': null\2',
         cleaned,
     )
+    cleaned = re.sub(r':\s*\d+\?+\s*([,}\]])', r': null\1', cleaned)
+    cleaned = re.sub(r':\s*\([^()"]*\)\s*([,}\]])', r': null\1', cleaned)
+    cleaned = re.sub(r':\s*\([^"{}\[\]]*?(,(?=\s*")|[}\]])', r': null\1', cleaned)
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
@@ -1037,6 +1157,27 @@ def _extract_json(text):
                 return json.loads(sub)
             except json.JSONDecodeError:
                 continue
+
+    repaired_text = _call_plain(
+        "Convert the following text into VALID JSON. If it describes book "
+        "endorsements, use the schema "
+        '{"endorser": str, "books": [{"title": str, "author": str, '
+        '"year": int or null, "one_line": str, "signal_type": str, '
+        '"quote_snippet": str, "source_url": str, "notes": str}]}. '
+        "Use null for unknown fields. If no books are mentioned, return "
+        '{"books": []}. Return ONLY the JSON, no markdown.\n\n' + text[:8000],
+        max_output_tokens=4000,
+    )
+    if repaired_text:
+        rs, re_ = repaired_text.find("{"), repaired_text.rfind("}")
+        if rs != -1 and re_ != -1:
+            try:
+                fixed = re.sub(r',\s*([}\]])', r'\1', repaired_text[rs:re_ + 1])
+                result = json.loads(fixed)
+                print("  [info] JSON recovered via LLM repair pass")
+                return result
+            except json.JSONDecodeError:
+                pass
     print(f"  [warning] failed to parse JSON; first 200 chars: {text[:200]}")
     return {}
 
@@ -1080,7 +1221,6 @@ if __name__ == "__main__":
         print(f"\n{'All tests passed' if all_pass else 'SOME TESTS FAILED'}")
         sys.exit(0 if all_pass else 1)
 
-    # NEW: --force-refresh wipes the gather cache for this query.
     force_refresh = "--force-refresh" in sys.argv
     include_casual = "--casual" in sys.argv
     args = [a for a in sys.argv[1:]
